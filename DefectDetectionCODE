@@ -1,0 +1,625 @@
+#Dylan Doan
+#ME295B
+#February 13, 2023
+#Defect Detection Program for Ceramic On-Demand Extrusion
+#This program will detect defects for overhead images during the ceramic on-demand demand extrusion processs through a CNN
+#Defect classes overextrusion high, overextrusion low, underextrusion, underextrusion high, underextrusion low, 
+#stringing, zero defect, high exposure, low exposure,
+#Radiation heat lamp drying time controlled by processesing times and classes: Optimal Exposure and Low Exposure
+#
+
+#Function used to add a path to the system path list. 
+import sys
+sys.path.append('/path/to/directory')
+
+#Import libraries for operating systems, time, regular expressions, computer vision, and numerical arrays.
+import os, time
+import re, cv2
+import numpy as np
+
+#Import FilterGraph class for capturing video streams from various video capture devices
+from pygrabber.dshow_graph import FilterGraph
+
+#Serial modules used for serial communication with hardware devices and listing available serial ports on the system.
+#STL used for visualizing 3D Models in STL file format.
+import serial, serial.tools.list_ports
+import stl_visualization_ISO as stl_viz
+
+#Tensorflow module used for machine learning tasks such as image preprocessing, loading trained models, and applied CNN's
+#for image classification.
+from tensorflow.keras.preprocessing.image import img_to_array, load_img
+from tensorflow.keras.models import load_model
+from tensorflow.keras.applications.vgg16 import preprocess_input
+
+#This function retrieves the index values of two camera devices, camName1 and camName2 using the Filtergraph instance. Filtergraph object
+#prompts the user to enter the name of the desired camera device.
+def getCameraIndex(camName1, camName2):
+    graph = FilterGraph()
+    if camName1 == "Not sure":
+        print(graph.get_input_devices())  # list of camera device
+        device1 = input("\nEnter name of desired camera 1: ")
+    else:
+        device1 = graph.get_input_devices().index(camName1)
+    if camName2 == "Not sure":
+        print(graph.get_input_devices())  # list of camera device
+        device2 = input("\nEnter name of desired camera 2: ")
+    else:
+        device2 = graph.get_input_devices().index(camName2)
+    return device1, device2
+
+#Function will send command to a serial device and receives an output. Function starts by checking
+#input line is not empty or has "M105" in the string. If valid, function will output a command to the serial device.
+def command(ser, line):
+    matchM105 = re.findall("M105",line)
+    if line != "" and line[0] != ";" and not matchM105:
+        print(line)
+        ser.write(str.encode(line+"\r\n"))
+        while True:
+            out_line = ser.readline()
+            print(out_line)
+            if out_line == b'ok\n':
+                break
+    else:
+        print(line)
+
+#Function will set the elapsed time for each layer in a GCODE file by taking an input gfile and a times files.
+#This function will help store the elapsed time for each layer, keep track of number/height of layers.
+def set_time_elapsed(gfile, times_file):
+    gfile_read = open(gfile, 'r')
+    times = open(times_file, 'w+')
+    time_elapsed = layer_count = time1 = Z = 0
+    line_count = 1
+
+    t = True
+    while t:
+        line = gfile_read.readline()
+        if not line:
+            global final_line
+            final_line = line_count - 1
+            t = False
+            times.write(str(time_elapsed) + ',' + str(final_line) + ',' + str(Z + 15) + '\n')
+            print("\nTotal number of layers: " + str(layer_count))
+            time.sleep(2)
+            break
+
+        mesh_line = re.findall('NONMESH', line)
+
+        if mesh_line:
+            j = True
+            while j:
+                line = gfile_read.readline()
+                line_count += 1
+                Z = get_Z(line)
+                if Z > 0:
+                    j = False
+                    break
+
+        timeline = re.findall(';TIME_ELAPSED:', line)
+
+        if timeline:
+            time2 = re.findall(r'[\d.\d]+', line)
+            time2 = float(time2[0])
+            time_elapsed = time2 - time1
+            times.write(str(time_elapsed) + ',' + str(line_count) + ',' + str(Z) + '\n')
+            layer_count += 1
+            time1 = time2
+        line_count += 1
+
+#Function will retrieve the Z height of a layer in a GCODE file.
+def get_Z(line):
+    Z = 0
+    items = re.findall('Z',line)
+    if items:
+        items = line.split('X',1)[1]
+        items = items.split()
+        if len(items) > 2:
+            Z = re.findall(r'[\d.\d]+',items[2])
+            Z = float(Z[0])
+    return Z
+
+#Function will retrieve the X and Y coordinates of a layer in a GCODE file.
+def get_XY(line):
+    X = Y = 0
+    if re.findall("X", line):
+        items = line.split("X",1)[1]
+        items = items.split()
+        if len(items) > 1:
+            X = re.findall(r'[\d.\d]+',items[0])
+            Y = re.findall(r'[\d.\d]+',items[1])
+            X = float(X[0])
+            Y = float(Y[0])
+    return X,Y
+
+#Function will parse a line from a GCODE file and extract elapsed time, line number, and Z value using regular expressions.
+def get_time_elapsed(times_file):
+    line = times_file.readline()
+    if not line:  ### if 'EOF'
+        return -1, -1, -1
+
+    items = line.split(',')
+    elapsed_time = re.findall(r'[\d.\d]+', items[0])
+    time_line = re.findall(r'[\d.\d]+', items[1])
+    Z = re.findall(r'[\d.\d]+', items[2])
+    elapsed_time = float(elapsed_time[0])
+    time_line = int(time_line[0])
+    Z = float(Z[0])
+    return elapsed_time, time_line, Z
+
+#Function will send commands to CODE printer to adjust the extruder position. "ser" is the serial connection to the printer
+#"amount" is the amount to be adjusted. "retract" indicates whether the extruder should be extracted quickly or slowly.
+#Starts by setting extruder position to relative posiitoning (M83).
+def adjust_extruder(ser, amount, retract):
+    if retract == 1:
+        command(ser,"M83") ### Set Relative Extruder Positioning
+        command(ser,"G0 F4000 E"+str(amount))
+        command(ser, "M82") ### Return to Absolute Extruder Positioning
+    else: # Return slowly
+        command(ser,"M83") ### Set Relative Extruder Positioning
+        command(ser,"G0 F750 E"+str(amount))
+        command(ser, "M82") ### Return to Absolute Extruder Positioning
+        command(ser,"G0 F2000")
+
+#Function will modify feed rate amount based on a given "alt amount". If the GCODE line starts with "G", followed by "F",
+#the feedrate number will be multiplied by the "alt amount" and replaces the original feedrate in the line with a new one.
+def adjust_feedrate_amount(line, alt_amount):
+    if line[0] == 'G':
+        Fnnn_split = line.split('F')
+        if Fnnn_split:
+            Fnnn_split = Fnnn_split[-1]
+            Fnnn = re.findall(r'[\d.\d]+',Fnnn_split)
+            Fnnn_alt = float(Fnnn[0]) * alt_amount
+            line = line.replace("F"+Fnnn[0],"F"+str(Fnnn_alt))
+            print(f'Ennn:{Fnnn[0]}\tEnnn_alt:{Fnnn_alt}')
+    return line
+
+#Function will modify the input "line" string to change the extrusion amount by a factor of "alt amount".
+#If g0g1 is 1 with "E", the function extracts the extrusion amount from the line and multiplies by "alt amount".
+#The modified extrusion amount will then be replaced in the original line string.
+def adjust_extrusion_amount(line, alt_amount):
+    if re.findall("G0", line) or re.findall("G1", line):
+        g0g1 = 1
+    else:
+        g0g1 = 0
+    if g0g1 and re.search('E',line):
+        Ennn = line.split('E')
+        if Ennn:
+            Ennn = Ennn[-1]
+            Ennn = re.findall(r'[-?\d.\d]+',Ennn)
+            Ennn_alt = float(Ennn[0]) * alt_amount
+            line = line.replace("E"+Ennn[0],"E"+str(Ennn_alt))
+            print(f'Ennn:{Ennn[0]}\tEnnn_alt:{Ennn_alt}')
+    return
+
+#Function readys GCODE file line by line and extracts the initial extruder and bed temperatures (M104/M140) and
+#returns them as float values
+def find_init_temperature(gfile):
+    extruder_temp = bed_temp = 0
+    gcode = open(gfile, 'r')
+    find_temp = True
+    while find_temp:
+        line = gcode.readline()
+        extemp = re.findall("M104 S", line)
+        btemp = re.findall("M140 S", line)
+        if extemp:
+            extruder_temp = line.split("S", 1)[1]
+        if btemp:
+            bed_temp = line.split("S", 1)[1]
+        if extruder_temp and bed_temp:
+            find_temp = False
+            break
+    return float(extruder_temp), float(bed_temp)
+
+#Function takes erial port an the desired extruder and bed temperatures as input, and sends GCODE commands M104 S
+# and M140 S to set the temperatures
+def set_temperature(ser, extruder_temp, bed_temp):
+    command(ser, "M104 S" + str(extruder_temp))
+    command(ser, "M140 S" + str(bed_temp + 0))
+
+#Function sets the extruder and bed temperatures to zero
+def omit_temperature(ser):
+    set_temperature(ser, 0, 0)
+
+#Function accepts two webcam objects. Inside the while loop, the function reads frames from both cameras and displays them in two 
+#separate windows. 
+def video_capture(image_name, webcam1, webcam2):
+    count = 1
+    t = True
+    while t:
+        try:
+            time.sleep(0.001)
+            count += 1
+            check1, frame1 = webcam1.read()
+            check2, frame2 = webcam2.read()
+            cv2.imshow("Camera 1", frame1)
+            cv2.imshow("Camera 2", frame2)
+            if count == 325: ### Give time for cameras to autofocus
+                             ### & allow time for user to view camera feed
+                capture_image(image_name, webcam1, webcam2, frame1, frame2)
+                t = False
+                time.sleep(2)
+                break
+            elif count % 4 == 0:
+                print("*",end="",flush=True)
+        except(KeyboardInterrupt):
+            cv2.destroyAllWindows()
+            break
+
+#Function captures an image using provided webcams and saves to specified file path. Function also provides current frame
+#and prints over console.
+def capture_image(imfile, webcam1, webcam2, frame1, frame2):
+    cam1_fps = webcam1.get(cv2.CAP_PROP_FPS)
+    cam2_fps = webcam2.get(cv2.CAP_PROP_FPS)
+    print("\nCapture Images at %.2f FPS and %.2f FPS." %(cam1_fps, cam2_fps))
+    cv2.imwrite(filename=imfile+'_1.jpg', img=frame1)
+    cv2.imwrite(filename=imfile+'_2.jpg', img=frame2)
+    print("Images saved to directory")
+
+#Function takes two arguments: "list" and "val". Function iterates through each element of the list and compares it to
+#value "val". Based on value, the function returns False or True.
+def check(list_, val): # Check if val is GREATER than items in list
+    for x in list_: # Traverse the list
+        # compare with values in list with val
+        # If val is less
+        if val <= x:
+            return False
+    return True
+
+#Function will check position of CODE printer to determine if it has reached its goal position specified by goal parameters.
+def check_position(ser, goalx, goaly, goalz):
+    count = 0
+    X = round(goalx,2)
+    Y = round(goaly,2)
+    Z = round(goalz,2)
+    moving = True
+    while moving:
+        ser.write(str.encode("M114\r\n"))
+        line = ser.readline()
+        time.sleep(0.001)
+        if line != b'ok\n' and re.findall("Count",str(line)):
+            line = str(line)
+            print(line)
+            split_line = line.split()
+            xc = float(re.findall(r'[\d.\d]+', split_line[0])[0])
+            yc = float(re.findall(r'[\d.\d]+', split_line[1])[0])
+            zc = float(re.findall(r'[\d.\d]+', split_line[2])[0])
+            x_compare = xc-0.02 <= X <= xc+0.2
+            y_compare = yc-0.02 <= Y <= yc+0.2
+            z_compare = zc-0.02 <= Z <= zc+0.2
+            if x_compare and y_compare and z_compare:
+                moving = False
+                break
+        elif count > 10000: # Escape if check is running too long
+            moving = False
+        elif count%200 == 0: # Output goal position
+            command(ser,"G0 X"+str(goalx)+" Y"+str(goaly)+" Z"+str(goalz))
+
+        count +=1
+
+#This function receives a directory of images, a trained model, some factors to adjust the CODE printer's feedrate, and
+#an extrusion factor, and returns a tuple with the detected defect, the number of files, the feedrate factor, the extrusion
+#factor, and the defect ratio. If the model detects overextrusion, the feedrate factor increases and extrusion factor decreases.
+#If underextrusion, the feedrate factor decreases, and extrusion factor increases. If stringing, the printer will pause.
+#Zero defects returns "No Defects".
+def class_predictions(directory, trained_model, shape, weights, feedrate_factor, extrusion_factor):
+     predictions = []
+     number_files = 0
+     for file_name in os.listdir(directory):
+         if re.findall('split', file_name):
+             image_name = os.path.join(directory, file_name)
+             img = load_img(image_name, target_size=(shape, shape, 3))
+             img_t = img_to_array(img)
+             img_t = np.expand_dims(img_t, axis=0)
+             number_of_black_pix = np.sum(img_t == 0)
+             zeros_check = number_of_black_pix / img_t.size
+             # np.count_nonzero(check_values)
+             if zeros_check <= 0.85:
+                 number_files += 1
+                 img = preprocess_input(img_t)
+                 class_defects = trained_model.predict(img)
+                 print(class_defects)
+                 check_values = np.greater(class_defects, 0.75).astype(int)
+                 print(check_values)
+                 predictions.append(check_values)
+
+             else:
+                 os.remove(image_name)
+
+     wpredictions = np.multiply(predictions, weights) #Weighted Predictions
+     wpredictions = np.sum(wpredictions, 0)[0]
+     av_nodefects = wpredictions[0] / number_files #Adjusted Value No Defects
+     av_overextrusion = (wpredictions[1] + wpredictions[2]) / (1.5 * number_files) #Adjusted Value Overextrusion
+     av_underextrusion = (wpredictions[3] + wpredictions[4] + wpredictions[5]) / (2.3 * number_files) #Adjusted Value Underextrusion
+     av_stringing = wpredictions[6] / number+files #Adjusted Value Stringing
+
+     if check([av_nodefects, av_underextrusion], av_overextrusion):
+         defect = 'overextrusion'
+         print(av_overextrusion)
+         def_ratio = av_overextrusion
+         if av_overextrusion > 0.6:
+             feedrate_factor += 0.05
+             extrusion_factor -= 0.05
+         elif av_overextrusion <= 0.6 and av_overextrusion > 0.3:
+             feedrate_factor += 0.025
+             extrusion_factor -= 0.025
+         else:
+             feedrate_factor += 0.01
+             extrusion_factor -= 0.01
+     elif check([av_nodefects, av_overextrusion], av_underextrusion):
+         defect = 'underextrusion'
+         print(av_underextrusion)
+         def_ratio = av_underextrusion
+         if av_underextrusion > 0.6:
+             feedrate_factor -= 0.05
+             extrusion_factor += 0.05
+         elif av_underextrusion <= 0.6 and av_underextrusion > 0.3:
+             feedrate_factor -= 0.025
+             extrusion_factor += 0.025
+         else:
+             feedrate_factor -= 0.01
+             extrusion_factor += 0.01
+     elif check([av_nodefects, av_overextrusion, av_underextrusion], av_stringing):
+         defect = 'stringing'
+         print(av_stringing)
+         def_ratio = av_stringing
+         command(code, "M25")  # Pause 3D print due to stringing
+     else:  # no defects
+         defect = 'No defects'
+         def_ratio = av_nodefects
+
+     return defect, number_files, feedrate_factor, extrusion_factor, def_ratio
+
+#Function will predict the optimal exposure time for heat lamp based on corresponding weights. 
+def optimal_exposure_prediction(directory, trained_model, shape, weights, optimal_exposure_threshold):
+    if optimal_exposure_threshold <= 0:
+        raise ValueError("The optimal exposure threshold must be a positive number")
+
+    predictions = []
+    for file_name in os.listdir(directory):
+        if re.findall('split', file_name):
+            image_name = os.path.join(directory, file_name)
+            img = load_img(image_name, target_size=(shape, shape, 3))
+            img_t = img_to_array(img)
+            img_t = np.expand_dims(img_t, axis=0)
+            number_of_black_pix = np.sum(img_t == 0)
+            zeros_check = number_of_black_pix / img_t.size
+            if zeros_check <= 0.85:
+                img = preprocess_input(img_t)
+                class_defects = trained_model.predict(img)
+                check_values = np.greater(class_defects, 0.75).astype(int)
+                predictions.append(check_values)
+
+            else:
+                os.remove(image_name)
+
+    number_files = len(predictions)
+    wpredictions = np.multiply(predictions, weights) #Weighted Predictions
+    wpredictions = np.sum(wpredictions, 0)[0]
+    av_optimal = wpredictions[0] / number_files #Adjusted Value Optimal
+    av_suboptimal = wpredictions[1] / number_files #Adjusted Value Suboptimal
+
+    if check([av_optimal], av_suboptimal):
+        prediction = av_optimal
+        if prediction >= optimal_exposure_threshold:
+            print('Optimal exposure achieved! Turning off the heat lamp...')
+            command(CODE, "M107")
+        else:
+            print('Suboptimal exposure detected! Turning on the heat lamp...')
+            command(CODE, "M107")
+    else:
+        prediction = av_suboptimal
+        print('Suboptimal exposure detected! Turning on the heat lamp...')
+        command(CODE, "M106")
+
+    return prediction, number_files
+
+#Code block will setup a connection to the CODE printer through a serial port. First available COM port will set up a serial
+#connection to the printer with a baudrate of 115200.
+port_printer = [comport.device for comport in serial.tools.list_ports.comports()][0]
+print("CODE Printer available on COM port: "+port_printer)
+CODE = serial.Serial(port_printer,baudrate=115200)
+CODE.close()
+CODE.open()
+
+time.sleep(1)
+
+#Code block will set up a video capture using the selected camera index. Adjustment of the camera resolution to the specified
+#pixel size. Camera name is specified in function: getCameraIndex.
+camIdx1, camIdx2 = getCameraIndex('IPEVO V4K PRO 1', 'IPEVO V4K PRO 2') #Camera Name/Indices
+key = cv2.waitKey(1)
+webcam1 = cv2.VideoCapture(camIdx1,cv2.CAP_DSHOW)
+webcam2 = cv2.VideoCapture(camIdx2,cv2.CAP_DSHOW)
+img_size_x = 2400 # Ideal pixel size x
+img_size_y = 2400 # Ideal pixel size y
+webcam1.set(cv2.CAP_PROP_FRAME_WIDTH, img_size_x)
+webcam1.set(cv2.CAP_PROP_FRAME_HEIGHT, img_size_y)
+webcam2.set(cv2.CAP_PROP_FRAME_WIDTH, img_size_x)
+webcam2.set(cv2.CAP_PROP_FRAME_HEIGHT, img_size_y)
+widthx = int(webcam1.get(cv2.CAP_PROP_FRAME_WIDTH)) # Actual pixel capture size x
+heighty = int(webcam1.get(cv2.CAP_PROP_FRAME_HEIGHT)) # Actual pixel capture size y
+imxy = '_'+str(widthx)+'W_'+str(heighty)+'H'
+
+#Code block to provide GCODE file name and directory. Layer is user defined.
+print('\n\n\n')
+gfile_name = 'CE5P_Cable Management Zip Tie'
+gfile = "C:/Users/Dylan/Documents/3D Prints/Cable Management/"+gfile_name+".gcode"
+times_file = 'C:/Users/Dylan/Documents/3D Prints/Cable Management/times_CE5P_Cable Management Zip Tie.txt'
+set_time_elapsed(gfile, times_file)
+
+n_layers = 1 # Capture images at every n layers
+
+time_tempa = time.time()
+
+#Code block to load VGG16 Models (Extrusion and Heat Lamp) from directory with printed lead time.
+print("Loading models")
+model1_name = "C:"
+model2_name = "C:"
+toc = time.time()
+load_time = toc - tic
+print(f"Model load times: {load_time:.2f} seconds")
+model1_shape = vgg16_model_extrusion.layers[0].input_shape[1:] # Extract the input shape of the input tensor (height and width)
+model2_shape = vgg16_model_heat_lamp.layers[0].input_shape[1:] # Extract the input shape of the input tensor (height and width)
+shape1hw = model1_shape[0]
+shape2hw = model2_shape[0]
+extrusion_class_weights = [1, # No defects
+            1.0, 0.5, # overextrusion_high, overextrusion_low
+            0.75, 1.0, 0.25, # underextrusion, underextrusion_high, underextrusion_low
+            1.0] #stringing
+heat_lamp_class_weights = [1, # Optimal Exposure
+            1] #Low Exposure
+#Code block will start the printing process.
+print('\n\nStart printing from file.\n\n')
+
+gfile_print = open(gfile,'r')
+times = open(times_file,'r')
+linecount = 1
+layercount = 0
+
+X_line = Y_line = Z_line = 0
+elapsed_time, layerbreak, Z = get_time_elapsed(times)
+timepause = elapsed_time
+time.sleep(2)
+
+goal_X = 25
+
+### Default values
+fr_factor = 1.00 #Feedrate adjustment factor, percent
+alt_amount = 1.00 #Extrusion adjustment factor, percent
+optimal_exposure_threshold = 0.75 #Exposure factor, percent
+
+#Defect Detection Printing Loop
+#Code block loop will iterate over each line of the GCODE file, send commands to the printer, and perform a task during a
+#layer break. Tasks include adjusting printer parameters, capturing image, and evaluating image for defects using
+#pre-trained model. Loop continues when it reaches end of file.
+while True:
+     try:
+         line = gfile_print.readline()
+
+         ### End of g-code file, end program
+         endprint = re.findall(";Wipe out", line)
+         if not line or endprint or linecount == final_line:
+             command(CODE, "M302 S0") #Disable Code Extrude
+             omit_temperature(CODE) #Disables Temperature
+             print("\nFinished printing.\n")
+             adjust_extruder(CODE, -3, 1)  ## amount to retract in mm
+             command(CODE, "G0 Y200 Z" + str(Z + 10))
+             cv2.destroyAllWindows()
+             wait_finish = input("\nConfirm piece is removed from print bed by hitting 'enter'.\n")
+             time.sleep(5)
+             command(CODE, "G0 Y200 Z" + str(Z + 10))
+             CODE.close()
+             break
+
+         else:
+             print("Layer " + str(layercount) + ", Line " + str(linecount) + " of " + str(layerbreak))
+
+             #Send GCODE to CODE Printer
+             command(CODE, line)
+             command(CODE, "M302 S0") #Disable Code Extrude
+             omit_temperature(CODE) #Disables Temperature
+
+             if linecount == layerbreak - 1:  #Get layer final X and Y positions
+                 X_line, Y_line = get_XY(line)
+                 if X_line > 0 and Y_line > 0:
+                     X = X_line
+                     Y = Y_line
+
+             if linecount == layerbreak:
+                 print("\n\nLine: " + str(linecount) + ", Break Layer: " + str(layercount) + "\n\n")
+
+                 if layercount % n_layers == 0:
+                     #Retract extruder
+                     adjust_extruder(CODE, -8, 1)  ## amount to retract in mm
+
+                     #Position for Camera 1 Capture (middle of build plate)
+                     goal_Z = Z + 0
+                     goal_X = 175
+                     goal_Y = 175
+                     command(CODE, "G0 Z" + str(goal_Z))
+                     command(CODE, "G0 F5000 X" + str(goal_X) + " Y" + str(goal_Y) + " Z" + str(goal_Z))
+                     
+                     #Check position
+                     time.sleep(1)
+                     check_position(CODE, goal_X, goal_Y, goal_Z)
+
+                     #Capture overhead image for Camera 1 and make directory for prediction images
+                     ts = str(time.strftime("%Y%m%d%H%M"))
+                     predict_dir_extrusion = os.path.join('ML_training\predict_imgs_extrusion',
+                                                str(ts) + '_Layer' + str(layercount) + '_' + gfile_name)
+                     os.mkdir(predict_dir_extrusion)
+                     imfile = os.path.join(predict_dir_extrusion, gfile_name + "_Layer" + str(layercount) + str(imxy) + ".jpg")
+                     video_capture(imfile, webcam1)
+
+                     #Position for Camera 2 Capture (right rear of build plate)
+                     goal_Z = Z + 0
+                     goal_X = 325
+                     goal_Y = 325
+                     command(CODE, "G0 Z" + str(goal_Z))
+                     command(CODE, "G0 F5000 X" + str(goal_X) + " Y" + str(goal_Y) + " Z" + str(goal_Z))
+
+                     #Capture overhead image for Camera 2 and make directory for prediction images
+                     ts = str(time.strftime("%Y%m%d%H%M"))
+                     predict_dir_heat_lamp = os.path.join('ML_training\predict_imgs_heat_lamp', str(ts) + '_Layer' + str(layercount) + '_' + gfile_name)
+                     os.mkdir(predict_dir_heat_lamp)
+                     imfile = os.path.join(predict_dir_heat_lamp, gfile_name + "_Layer" + str(layercount) + str(imxy) + ".jpg")
+                     video_capture(imfile, webcam2)
+
+                     #Return to last XYZ position
+                     gpositionXY = "X" + str(X) + " Y" + str(Y)
+                     gpositionZ = "Z" + str(Z)
+                     command(CODE, "G0 F1100 " + gpositionZ + " " + gpositionXY)
+
+                     #Evaluate images for extrusion
+                     stl_viz.gcode_overlay(widthx, heighty, gfile, predict_dir_extrusion, imfile, layercount)
+                     tic = time.time()
+                     defect, number_files, fr_factor, alt_amount, def_amt = class_predictions(
+                         predict_dir_extrusion, \
+                         vgg16_model_extrusion, shapehw, class_weights, fr_factor, alt_amount)
+                     toc = time.time()
+                     predict_time = toc - tic
+                     print(f'Model prediction time for {number_files} images: {predict_time}')
+
+                     #Evaluate images for lamp exposure
+                     prediction, num_files = optimal_exposure_prediction(predict_dir_heat_lamp, vgg16_model_heat_lamp, \
+                     shape2hw[0], heat_lamp_class_weights, optimal_exposure_threshold)
+
+                     # Check prediction and adjust heat lamp accordingly
+                     if prediction >= optimal_exposure_threshold:
+                         print('Optimal exposure achieved! Turning off the heat lamp...')
+                         command(CODE, "M107")
+                     else:
+                         print('Suboptimal exposure detected! Turning on the heat lamp...')
+                         command(CODE, "M106")
+
+                     #Change printer settings#
+                     line = adjust_feedrate_amount(line, fr_factor)
+                     line = adjust_extrusion_amount(line, alt_amount)
+
+                     #Change printer settings#
+
+                 elapsed_time, layerbreak, Z = get_time_elapsed(times)
+                 timepause += elapsed_time
+                 layercount += 1
+
+             linecount += 1
+
+ # Escape/Close program manually using ctrl+c
+     except(KeyboardInterrupt):
+         print("\nExit program.\n")
+         adjust_extruder(CODE,-3,1 ) #amount to retract in mm
+         time.sleep(0.01)
+         command(CODE,"G0 Y200 Z"+str(Z+10))
+         wait_finish = input("\nConfirm piece is removed from print bed by hitting 'enter'.\n")
+         time.sleep(2)
+         cv2.destroyAllWindows()
+         CODE.close()
+         break
+
+#Defect Detection Summary:
+#Reads in a G-code file line by line and sends the lines to the printer via a serial connection.
+#Captures overhead images of the print bed at two different positions using two webcams.
+#Predicts the quality of the print based on the captured images using pre-trained machine learning models.
+#Adjusts the feedrate and extrusion amount for the printer based on the predicted print quality.
+#Evaluates the lamp exposure of the print using another pre-trained machine learning model.
+#Adjusts the lamp exposure based on the predicted lamp exposure quality.
+#Repeats steps 1-6 for each layer of the print until the print is complete.
+#Retracts the extruder and raises the print bed once the print is finished.
